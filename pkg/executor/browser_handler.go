@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -54,7 +55,6 @@ func (h *BrowserTaskHandler) Handle(ctx context.Context, task *interfaces.Task) 
 		// Ensure we navigate to Google first
 		err := h.ensureGoogleNavigation(ctx)
 		if err != nil {
-			h.takeScreenshotOnFailure(ctx, task.ID, "navigation_prerequisite_failed")
 			return fmt.Errorf("failed to navigate to Google before search: %w", err)
 		}
 	}
@@ -90,8 +90,6 @@ func (h *BrowserTaskHandler) handleNavigate(ctx context.Context, task *interface
 
 	err := h.browserAgent.Navigate(ctx, url)
 	if err != nil {
-		// Take screenshot on failure for debugging
-		h.takeScreenshotOnFailure(ctx, task.ID, "navigate_action_failed")
 		return fmt.Errorf("failed to navigate to %s: %w", url, err)
 	}
 
@@ -99,6 +97,11 @@ func (h *BrowserTaskHandler) handleNavigate(ctx context.Context, task *interface
 		"action": "navigate",
 		"url":    url,
 		"status": "success",
+	}
+
+	// Save the task result
+	if err := h.saveTaskResult(ctx, task, task.Result); err != nil {
+		h.logger.WithField("error", err).Warn("Failed to save task result")
 	}
 
 	return nil
@@ -117,8 +120,6 @@ func (h *BrowserTaskHandler) handleClick(ctx context.Context, task *interfaces.T
 
 	result, err := h.browserAgent.ExecuteAction(ctx, action)
 	if err != nil {
-		// Take screenshot on failure for debugging
-		h.takeScreenshotOnFailure(ctx, task.ID, "click_action_failed")
 		return fmt.Errorf("failed to click element %s: %w", selector, err)
 	}
 
@@ -126,6 +127,11 @@ func (h *BrowserTaskHandler) handleClick(ctx context.Context, task *interfaces.T
 		"action":   "click",
 		"selector": selector,
 		"result":   result,
+	}
+
+	// Save the task result
+	if err := h.saveTaskResult(ctx, task, task.Result); err != nil {
+		h.logger.WithField("error", err).Warn("Failed to save task result")
 	}
 
 	return nil
@@ -150,8 +156,6 @@ func (h *BrowserTaskHandler) handleType(ctx context.Context, task *interfaces.Ta
 
 	result, err := h.browserAgent.ExecuteAction(ctx, action)
 	if err != nil {
-		// Take screenshot on failure for debugging
-		h.takeScreenshotOnFailure(ctx, task.ID, "type_action_failed")
 		return fmt.Errorf("failed to type in element %s: %w", selector, err)
 	}
 
@@ -160,6 +164,33 @@ func (h *BrowserTaskHandler) handleType(ctx context.Context, task *interfaces.Ta
 		"selector": selector,
 		"text":     text,
 		"result":   result,
+	}
+
+	// Save the task result
+	if err := h.saveTaskResult(ctx, task, task.Result); err != nil {
+		h.logger.WithField("error", err).Warn("Failed to save task result")
+	}
+
+	// If this was a search action, submit the search by pressing Enter
+	if h.isSearchAction(task.Description) {
+		h.logger.Info("Submitting search by pressing Enter")
+
+		// Press Enter to submit the search
+		enterAction := interfaces.BrowserAction{
+			Type:     "type",
+			Selector: selector,
+			Value:    "\n", // Press Enter
+		}
+
+		_, err := h.browserAgent.ExecuteAction(ctx, enterAction)
+		if err != nil {
+			h.logger.WithField("error", err).Warn("Failed to submit search with Enter")
+		} else {
+			h.logger.Info("Search submitted successfully via Enter key")
+		}
+
+		// Wait a moment for the search results to load
+		time.Sleep(3 * time.Second)
 	}
 
 	return nil
@@ -209,6 +240,11 @@ func (h *BrowserTaskHandler) handleExtract(ctx context.Context, task *interfaces
 		"selector":     selector,
 		"extract_type": extractType,
 		"result":       result,
+	}
+
+	// Save the task result
+	if err := h.saveTaskResult(ctx, task, task.Result); err != nil {
+		h.logger.WithField("error", err).Warn("Failed to save task result")
 	}
 
 	return nil
@@ -273,7 +309,7 @@ func (h *BrowserTaskHandler) inferActionFromDescription(description string) stri
 	desc := strings.ToLower(description)
 
 	// Navigation patterns
-	if strings.Contains(desc, "navigate") || strings.Contains(desc, "go to") || strings.Contains(desc, "visit") || strings.Contains(desc, "open") {
+	if strings.Contains(desc, "navigate") || strings.Contains(desc, "go to") || strings.Contains(desc, "visit") || strings.Contains(desc, "open") || strings.Contains(desc, "launch") || strings.Contains(desc, "start") {
 		return "navigate"
 	}
 
@@ -308,7 +344,7 @@ func (h *BrowserTaskHandler) inferActionFromDescription(description string) stri
 	}
 
 	// Default to navigate for most browser tasks
-	if strings.Contains(desc, "page") || strings.Contains(desc, "site") || strings.Contains(desc, "website") {
+	if strings.Contains(desc, "page") || strings.Contains(desc, "site") || strings.Contains(desc, "website") || strings.Contains(desc, "browser") || strings.Contains(desc, "chrome") {
 		return "navigate"
 	}
 
@@ -398,7 +434,7 @@ func (h *BrowserTaskHandler) setParametersFromDescription(task *interfaces.Task)
 		}
 
 		// Use more robust selector for Google search input
-		task.Parameters["selector"] = "textarea[name='q'], input[name='q'], input[aria-label*='Search'], textarea[aria-label*='Search'], #APjFqb"
+		task.Parameters["selector"] = "textarea[name='q'], input[name='q'], input[aria-label*='Search'], textarea[aria-label*='Search'], #APjFqb, .gLFyf, input[title='Search'], textarea[title='Search']"
 
 	case "click":
 		// Set default selector for common elements
@@ -424,52 +460,6 @@ func (h *BrowserTaskHandler) setParametersFromDescription(task *interfaces.Task)
 	}
 }
 
-// takeScreenshotOnFailure takes a screenshot when a browser task fails for debugging purposes
-func (h *BrowserTaskHandler) takeScreenshotOnFailure(ctx context.Context, taskID, reason string) {
-	screenshot, err := h.browserAgent.Screenshot(ctx)
-	if err != nil {
-		h.logger.WithFields(map[string]interface{}{
-			"task_id": taskID,
-			"reason":  reason,
-			"error":   err,
-		}).Warn("Failed to take screenshot on failure")
-		return
-	}
-
-	// Create screenshots directory if it doesn't exist
-	screenshotsDir := "screenshots"
-	if err := os.MkdirAll(screenshotsDir, 0755); err != nil {
-		h.logger.WithFields(map[string]interface{}{
-			"task_id": taskID,
-			"reason":  reason,
-			"error":   err,
-		}).Warn("Failed to create screenshots directory")
-		return
-	}
-
-	// Save screenshot to file with timestamp
-	filename := fmt.Sprintf("failure_%s_%s_%d.png", taskID, reason, time.Now().Unix())
-	fullPath := filepath.Join(screenshotsDir, filename)
-
-	if err := os.WriteFile(fullPath, screenshot, 0644); err != nil {
-		h.logger.WithFields(map[string]interface{}{
-			"task_id": taskID,
-			"reason":  reason,
-			"error":   err,
-			"path":    fullPath,
-		}).Warn("Failed to save screenshot to file")
-		return
-	}
-
-	h.logger.WithFields(map[string]interface{}{
-		"task_id":         taskID,
-		"reason":          reason,
-		"screenshot_size": len(screenshot),
-		"format":          "png",
-		"saved_to":        fullPath,
-	}).Info("Screenshot captured and saved on task failure")
-}
-
 // needsNavigation checks if a task description suggests it needs navigation first
 func (h *BrowserTaskHandler) needsNavigation(description string) bool {
 	desc := strings.ToLower(description)
@@ -487,4 +477,81 @@ func (h *BrowserTaskHandler) ensureGoogleNavigation(ctx context.Context) error {
 
 	h.logger.Info("Navigating to Google for search task")
 	return h.browserAgent.Navigate(ctx, "https://www.google.com")
+}
+
+// isSearchAction checks if a task description suggests it's a search action
+func (h *BrowserTaskHandler) isSearchAction(description string) bool {
+	desc := strings.ToLower(description)
+	return strings.Contains(desc, "search") || strings.Contains(desc, "enter") || strings.Contains(desc, "type")
+}
+
+// saveTaskResult saves the task result to a timestamped folder in the results directory
+func (h *BrowserTaskHandler) saveTaskResult(ctx context.Context, task *interfaces.Task, result interface{}) error {
+	// Create results directory with timestamp
+	timestamp := time.Now().Format("2006-01-02_15-04-05")
+	resultsDir := filepath.Join("results", timestamp)
+
+	if err := os.MkdirAll(resultsDir, 0755); err != nil {
+		h.logger.WithField("error", err).Warn("Failed to create results directory")
+		return err
+	}
+
+	// Take a screenshot of the final state
+	screenshot, err := h.browserAgent.Screenshot(ctx)
+	if err != nil {
+		h.logger.WithField("error", err).Warn("Failed to take final screenshot")
+	} else {
+		screenshotPath := filepath.Join(resultsDir, "final_screenshot.png")
+		if err := os.WriteFile(screenshotPath, screenshot, 0644); err != nil {
+			h.logger.WithField("error", err).Warn("Failed to save final screenshot")
+		} else {
+			h.logger.WithField("path", screenshotPath).Info("Final screenshot saved")
+		}
+	}
+
+	// Get page content
+	pageContent, err := h.browserAgent.GetPageContent(ctx)
+	if err != nil {
+		h.logger.WithField("error", err).Warn("Failed to get page content")
+	} else {
+		contentPath := filepath.Join(resultsDir, "page_content.html")
+		if err := os.WriteFile(contentPath, []byte(pageContent), 0644); err != nil {
+			h.logger.WithField("error", err).Warn("Failed to save page content")
+		} else {
+			h.logger.WithField("path", contentPath).Info("Page content saved")
+		}
+	}
+
+	// Create result metadata
+	resultData := map[string]interface{}{
+		"task_id":        task.ID,
+		"task_type":      task.Type,
+		"description":    task.Description,
+		"status":         task.Status,
+		"result":         result,
+		"parameters":     task.Parameters,
+		"timestamp":      time.Now().Format(time.RFC3339),
+		"execution_time": time.Since(task.CreatedAt).String(),
+	}
+
+	// Save result metadata as JSON
+	resultPath := filepath.Join(resultsDir, "task_result.json")
+	resultJSON, err := json.MarshalIndent(resultData, "", "  ")
+	if err != nil {
+		h.logger.WithField("error", err).Warn("Failed to marshal result data")
+		return err
+	}
+
+	if err := os.WriteFile(resultPath, resultJSON, 0644); err != nil {
+		h.logger.WithField("error", err).Warn("Failed to save result metadata")
+		return err
+	}
+
+	h.logger.WithFields(map[string]interface{}{
+		"task_id":     task.ID,
+		"results_dir": resultsDir,
+		"result_path": resultPath,
+	}).Info("Task result saved successfully")
+
+	return nil
 }
