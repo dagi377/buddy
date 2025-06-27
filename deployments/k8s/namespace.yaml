@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-agent
+  labels:
+    name: ai-agent
+    app: ai-agent-framework

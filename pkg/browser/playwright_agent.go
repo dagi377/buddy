@@ -1,0 +1,250 @@
+package browser
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/mxschmitt/playwright-go"
+	"github.com/ai-agent-framework/pkg/interfaces"
+)
+
+// PlaywrightAgent implements the BrowserAgent interface using Playwright
+type PlaywrightAgent struct {
+	browser playwright.Browser
+	page    playwright.Page
+	logger  interfaces.Logger
+	headless bool
+}
+
+// NewPlaywrightAgent creates a new Playwright-based browser agent
+func NewPlaywrightAgent(logger interfaces.Logger, headless bool) *PlaywrightAgent {
+	return &PlaywrightAgent{
+		logger:   logger,
+		headless: headless,
+	}
+}
+
+// Initialize starts the browser and creates a new page
+func (p *PlaywrightAgent) Initialize(ctx context.Context) error {
+	p.logger.Info("Initializing Playwright browser")
+
+	// Install Playwright browsers if needed
+	err := playwright.Install()
+	if err != nil {
+		return fmt.Errorf("failed to install Playwright: %w", err)
+	}
+
+	// Launch Playwright
+	pw, err := playwright.Run()
+	if err != nil {
+		return fmt.Errorf("failed to start Playwright: %w", err)
+	}
+
+	// Launch browser
+	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+		Headless: playwright.Bool(p.headless),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to launch browser: %w", err)
+	}
+
+	p.browser = browser
+
+	// Create new page
+	page, err := browser.NewPage()
+	if err != nil {
+		return fmt.Errorf("failed to create new page: %w", err)
+	}
+
+	p.page = page
+
+	p.logger.WithField("headless", p.headless).Info("Playwright browser initialized")
+	return nil
+}
+
+// Navigate navigates to the specified URL
+func (p *PlaywrightAgent) Navigate(ctx context.Context, url string) error {
+	p.logger.WithField("url", url).Info("Navigating to URL")
+
+	if p.page == nil {
+		return fmt.Errorf("browser not initialized")
+	}
+
+	_, err := p.page.Goto(url, playwright.PageGotoOptions{
+		WaitUntil: playwright.WaitUntilStateNetworkidle,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to navigate to %s: %w", url, err)
+	}
+
+	p.logger.WithField("url", url).Info("Navigation completed")
+	return nil
+}
+
+// ExecuteAction performs a browser action based on the action type
+func (p *PlaywrightAgent) ExecuteAction(ctx context.Context, action interfaces.BrowserAction) (interface{}, error) {
+	p.logger.WithFields(map[string]interface{}{
+		"action_type": action.Type,
+		"selector":    action.Selector,
+	}).Info("Executing browser action")
+
+	if p.page == nil {
+		return nil, fmt.Errorf("browser not initialized")
+	}
+
+	switch action.Type {
+	case "click":
+		return p.handleClick(action)
+	case "type":
+		return p.handleType(action)
+	case "select":
+		return p.handleSelect(action)
+	case "wait":
+		return p.handleWait(action)
+	case "scroll":
+		return p.handleScroll(action)
+	case "extract_text":
+		return p.handleExtractText(action)
+	case "extract_attribute":
+		return p.handleExtractAttribute(action)
+	default:
+		return nil, fmt.Errorf("unsupported action type: %s", action.Type)
+	}
+}
+
+// Screenshot takes a screenshot of the current page
+func (p *PlaywrightAgent) Screenshot(ctx context.Context) ([]byte, error) {
+	p.logger.Info("Taking screenshot")
+
+	if p.page == nil {
+		return nil, fmt.Errorf("browser not initialized")
+	}
+
+	screenshot, err := p.page.Screenshot(playwright.PageScreenshotOptions{
+		FullPage: playwright.Bool(true),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to take screenshot: %w", err)
+	}
+
+	p.logger.Info("Screenshot taken successfully")
+	return screenshot, nil
+}
+
+// GetPageContent returns the HTML content of the current page
+func (p *PlaywrightAgent) GetPageContent(ctx context.Context) (string, error) {
+	p.logger.Info("Getting page content")
+
+	if p.page == nil {
+		return "", fmt.Errorf("browser not initialized")
+	}
+
+	content, err := p.page.Content()
+	if err != nil {
+		return "", fmt.Errorf("failed to get page content: %w", err)
+	}
+
+	p.logger.WithField("content_length", len(content)).Info("Page content retrieved")
+	return content, nil
+}
+
+// Close closes the browser and cleans up resources
+func (p *PlaywrightAgent) Close(ctx context.Context) error {
+	p.logger.Info("Closing browser")
+
+	if p.browser != nil {
+		if err := p.browser.Close(); err != nil {
+			p.logger.WithField("error", err).Error("Failed to close browser")
+			return err
+		}
+	}
+
+	p.logger.Info("Browser closed successfully")
+	return nil
+}
+
+// Action handlers
+
+func (p *PlaywrightAgent) handleClick(action interfaces.BrowserAction) (interface{}, error) {
+	err := p.page.Click(action.Selector)
+	if err != nil {
+		return nil, fmt.Errorf("failed to click element %s: %w", action.Selector, err)
+	}
+	return "clicked", nil
+}
+
+func (p *PlaywrightAgent) handleType(action interfaces.BrowserAction) (interface{}, error) {
+	err := p.page.Fill(action.Selector, action.Value)
+	if err != nil {
+		return nil, fmt.Errorf("failed to type in element %s: %w", action.Selector, err)
+	}
+	return "typed", nil
+}
+
+func (p *PlaywrightAgent) handleSelect(action interfaces.BrowserAction) (interface{}, error) {
+	_, err := p.page.SelectOption(action.Selector, playwright.SelectOptionValues{
+		Values: &[]string{action.Value},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to select option in %s: %w", action.Selector, err)
+	}
+	return "selected", nil
+}
+
+func (p *PlaywrightAgent) handleWait(action interfaces.BrowserAction) (interface{}, error) {
+	selector, ok := action.Parameters["selector"].(string)
+	if !ok {
+		return nil, fmt.Errorf("selector parameter is required for wait action")
+	}
+
+	timeout := 5000.0 // default 5 seconds
+	if timeoutParam, ok := action.Parameters["timeout"]; ok {
+		if timeoutFloat, ok := timeoutParam.(float64); ok {
+			timeout = timeoutFloat
+		}
+	}
+
+	_, err := p.page.WaitForSelector(selector, playwright.PageWaitForSelectorOptions{
+		Timeout: playwright.Float(timeout),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to wait for selector %s: %w", selector, err)
+	}
+	return "waited", nil
+}
+
+func (p *PlaywrightAgent) handleScroll(action interfaces.BrowserAction) (interface{}, error) {
+	pixels := 0
+	if pixelsParam, ok := action.Parameters["pixels"]; ok {
+		if pixelsFloat, ok := pixelsParam.(float64); ok {
+			pixels = int(pixelsFloat)
+		}
+	}
+
+	_, err := p.page.Evaluate(fmt.Sprintf("window.scrollBy(0, %d)", pixels))
+	if err != nil {
+		return nil, fmt.Errorf("failed to scroll: %w", err)
+	}
+	return "scrolled", nil
+}
+
+func (p *PlaywrightAgent) handleExtractText(action interfaces.BrowserAction) (interface{}, error) {
+	text, err := p.page.TextContent(action.Selector)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract text from %s: %w", action.Selector, err)
+	}
+	return text, nil
+}
+
+func (p *PlaywrightAgent) handleExtractAttribute(action interfaces.BrowserAction) (interface{}, error) {
+	attrName, ok := action.Parameters["attribute"].(string)
+	if !ok {
+		return nil, fmt.Errorf("attribute parameter is required for extract_attribute action")
+	}
+
+	attr, err := p.page.GetAttribute(action.Selector, attrName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract attribute %s from %s: %w", attrName, action.Selector, err)
+	}
+	return attr, nil
+}

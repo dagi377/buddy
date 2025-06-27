@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-agent
+  namespace: ai-agent
+  labels:
+    app: ai-agent
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ai-agent
+  template:
+    metadata:
+      labels:
+        app: ai-agent
+    spec:
+      containers:
+      - name: ai-agent
+        image: ai-agent-framework:latest
+        imagePullPolicy: Never  # For local Minikube development
+        ports:
+        - containerPort: 8080
+        env:
+        - name: OLLAMA_URL
+          value: "http://ollama-service:11434"
+        - name: LOG_LEVEL
+          value: "info"
+        - name: BROWSER_HEADLESS
+          value: "true"
+        - name: MEMORY_TYPE
+          value: "memory"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-agent-service
+  namespace: ai-agent
+spec:
+  selector:
+    app: ai-agent
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080
+  type: LoadBalancer
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-agent-ingress
+  namespace: ai-agent
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+  - host: ai-agent.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: ai-agent-service
+            port:
+              number: 80
