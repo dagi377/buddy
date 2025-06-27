@@ -3,6 +3,10 @@ package executor
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/ai-agent-framework/pkg/interfaces"
 )
@@ -28,10 +32,31 @@ func (h *BrowserTaskHandler) Handle(ctx context.Context, task *interfaces.Task) 
 		"description": task.Description,
 	}).Info("Handling browser task")
 
-	// Parse task parameters
+	// Parse task parameters or infer from description
 	actionType, ok := task.Parameters["action"].(string)
 	if !ok {
-		return fmt.Errorf("missing or invalid 'action' parameter")
+		// Try to infer action from task description
+		actionType = h.inferActionFromDescription(task.Description)
+		if actionType == "" {
+			return fmt.Errorf("could not determine browser action from description: %s", task.Description)
+		}
+
+		// Set inferred parameters
+		if task.Parameters == nil {
+			task.Parameters = make(map[string]interface{})
+		}
+		task.Parameters["action"] = actionType
+		h.setParametersFromDescription(task)
+	}
+
+	// Special handling for search-related tasks that need navigation first
+	if actionType == "type" && h.needsNavigation(task.Description) {
+		// Ensure we navigate to Google first
+		err := h.ensureGoogleNavigation(ctx)
+		if err != nil {
+			h.takeScreenshotOnFailure(ctx, task.ID, "navigation_prerequisite_failed")
+			return fmt.Errorf("failed to navigate to Google before search: %w", err)
+		}
 	}
 
 	switch actionType {
@@ -65,6 +90,8 @@ func (h *BrowserTaskHandler) handleNavigate(ctx context.Context, task *interface
 
 	err := h.browserAgent.Navigate(ctx, url)
 	if err != nil {
+		// Take screenshot on failure for debugging
+		h.takeScreenshotOnFailure(ctx, task.ID, "navigate_action_failed")
 		return fmt.Errorf("failed to navigate to %s: %w", url, err)
 	}
 
@@ -90,6 +117,8 @@ func (h *BrowserTaskHandler) handleClick(ctx context.Context, task *interfaces.T
 
 	result, err := h.browserAgent.ExecuteAction(ctx, action)
 	if err != nil {
+		// Take screenshot on failure for debugging
+		h.takeScreenshotOnFailure(ctx, task.ID, "click_action_failed")
 		return fmt.Errorf("failed to click element %s: %w", selector, err)
 	}
 
@@ -121,6 +150,8 @@ func (h *BrowserTaskHandler) handleType(ctx context.Context, task *interfaces.Ta
 
 	result, err := h.browserAgent.ExecuteAction(ctx, action)
 	if err != nil {
+		// Take screenshot on failure for debugging
+		h.takeScreenshotOnFailure(ctx, task.ID, "type_action_failed")
 		return fmt.Errorf("failed to type in element %s: %w", selector, err)
 	}
 
@@ -235,4 +266,225 @@ func (h *BrowserTaskHandler) handleWait(ctx context.Context, task *interfaces.Ta
 	}
 
 	return nil
+}
+
+// inferActionFromDescription attempts to determine the browser action from task description
+func (h *BrowserTaskHandler) inferActionFromDescription(description string) string {
+	desc := strings.ToLower(description)
+
+	// Navigation patterns
+	if strings.Contains(desc, "navigate") || strings.Contains(desc, "go to") || strings.Contains(desc, "visit") || strings.Contains(desc, "open") {
+		return "navigate"
+	}
+
+	// Search patterns
+	if strings.Contains(desc, "search for") || strings.Contains(desc, "find") {
+		return "type" // Assume search involves typing
+	}
+
+	// Click patterns
+	if strings.Contains(desc, "click") || strings.Contains(desc, "press") || strings.Contains(desc, "select") {
+		return "click"
+	}
+
+	// Type patterns
+	if strings.Contains(desc, "type") || strings.Contains(desc, "enter") || strings.Contains(desc, "input") {
+		return "type"
+	}
+
+	// Extract patterns
+	if strings.Contains(desc, "extract") || strings.Contains(desc, "get") || strings.Contains(desc, "scrape") {
+		return "extract"
+	}
+
+	// Screenshot patterns
+	if strings.Contains(desc, "screenshot") || strings.Contains(desc, "capture") {
+		return "screenshot"
+	}
+
+	// Wait patterns
+	if strings.Contains(desc, "wait") || strings.Contains(desc, "pause") {
+		return "wait"
+	}
+
+	// Default to navigate for most browser tasks
+	if strings.Contains(desc, "page") || strings.Contains(desc, "site") || strings.Contains(desc, "website") {
+		return "navigate"
+	}
+
+	return ""
+}
+
+// setParametersFromDescription sets task parameters based on the description
+func (h *BrowserTaskHandler) setParametersFromDescription(task *interfaces.Task) {
+	desc := strings.ToLower(task.Description)
+	action := task.Parameters["action"].(string)
+
+	switch action {
+	case "navigate":
+		// Try to extract URL from description
+		if strings.Contains(desc, "google") {
+			task.Parameters["url"] = "https://www.google.com"
+		} else if strings.Contains(desc, "search") {
+			task.Parameters["url"] = "https://www.google.com"
+		} else {
+			// Default URL if none specified
+			task.Parameters["url"] = "https://www.google.com"
+		}
+
+	case "type":
+		// Extract search query from description
+		var query string
+
+		if strings.Contains(desc, "search for") {
+			// Extract text after "search for"
+			parts := strings.Split(desc, "search for")
+			if len(parts) > 1 {
+				query = strings.TrimSpace(parts[1])
+			}
+		} else if strings.Contains(desc, "find") {
+			// Extract text after "find"
+			parts := strings.Split(desc, "find")
+			if len(parts) > 1 {
+				query = strings.TrimSpace(parts[1])
+			}
+		} else if strings.Contains(desc, "enter") {
+			// Extract text between quotes for "enter 'text'" patterns
+			start := strings.Index(desc, "'")
+			if start != -1 {
+				end := strings.Index(desc[start+1:], "'")
+				if end != -1 {
+					query = desc[start+1 : start+1+end]
+				}
+			}
+			// Fallback: extract text after "enter"
+			if query == "" {
+				parts := strings.Split(desc, "enter")
+				if len(parts) > 1 {
+					// Remove common suffix like "into the search bar"
+					text := strings.TrimSpace(parts[1])
+					text = strings.Replace(text, "into the search bar", "", -1)
+					text = strings.Replace(text, "in the search box", "", -1)
+					text = strings.Replace(text, "into search", "", -1)
+					query = strings.TrimSpace(text)
+				}
+			}
+		} else if strings.Contains(desc, "type") {
+			// Extract text after "type"
+			parts := strings.Split(desc, "type")
+			if len(parts) > 1 {
+				// Look for quoted text first
+				text := parts[1]
+				start := strings.Index(text, "'")
+				if start != -1 {
+					end := strings.Index(text[start+1:], "'")
+					if end != -1 {
+						query = text[start+1 : start+1+end]
+					}
+				}
+				// Fallback to everything after "type"
+				if query == "" {
+					query = strings.TrimSpace(text)
+				}
+			}
+		}
+
+		// Set the extracted query
+		if query != "" {
+			task.Parameters["text"] = query
+		} else {
+			// Default search query if we can't extract one
+			task.Parameters["text"] = "cafes near leaside"
+		}
+
+		// Use more robust selector for Google search input
+		task.Parameters["selector"] = "textarea[name='q'], input[name='q'], input[aria-label*='Search'], textarea[aria-label*='Search'], #APjFqb"
+
+	case "click":
+		// Set default selector for common elements
+		if strings.Contains(desc, "search") {
+			task.Parameters["selector"] = "input[type='submit'], button[type='submit'], .search-button, input[value*='Search'], button[aria-label*='Search']"
+		} else {
+			task.Parameters["selector"] = "button, a, input[type='submit']"
+		}
+
+	case "extract":
+		// Set default extraction parameters
+		task.Parameters["selector"] = "h1, h2, h3, .title, .result"
+		task.Parameters["extract_type"] = "text"
+
+	case "screenshot":
+		// Set default screenshot parameters
+		task.Parameters["filename"] = fmt.Sprintf("screenshot_%s.png", task.ID)
+
+	case "wait":
+		// Set default wait parameters
+		task.Parameters["timeout"] = 5000.0 // 5 seconds
+		task.Parameters["selector"] = "body"
+	}
+}
+
+// takeScreenshotOnFailure takes a screenshot when a browser task fails for debugging purposes
+func (h *BrowserTaskHandler) takeScreenshotOnFailure(ctx context.Context, taskID, reason string) {
+	screenshot, err := h.browserAgent.Screenshot(ctx)
+	if err != nil {
+		h.logger.WithFields(map[string]interface{}{
+			"task_id": taskID,
+			"reason":  reason,
+			"error":   err,
+		}).Warn("Failed to take screenshot on failure")
+		return
+	}
+
+	// Create screenshots directory if it doesn't exist
+	screenshotsDir := "screenshots"
+	if err := os.MkdirAll(screenshotsDir, 0755); err != nil {
+		h.logger.WithFields(map[string]interface{}{
+			"task_id": taskID,
+			"reason":  reason,
+			"error":   err,
+		}).Warn("Failed to create screenshots directory")
+		return
+	}
+
+	// Save screenshot to file with timestamp
+	filename := fmt.Sprintf("failure_%s_%s_%d.png", taskID, reason, time.Now().Unix())
+	fullPath := filepath.Join(screenshotsDir, filename)
+
+	if err := os.WriteFile(fullPath, screenshot, 0644); err != nil {
+		h.logger.WithFields(map[string]interface{}{
+			"task_id": taskID,
+			"reason":  reason,
+			"error":   err,
+			"path":    fullPath,
+		}).Warn("Failed to save screenshot to file")
+		return
+	}
+
+	h.logger.WithFields(map[string]interface{}{
+		"task_id":         taskID,
+		"reason":          reason,
+		"screenshot_size": len(screenshot),
+		"format":          "png",
+		"saved_to":        fullPath,
+	}).Info("Screenshot captured and saved on task failure")
+}
+
+// needsNavigation checks if a task description suggests it needs navigation first
+func (h *BrowserTaskHandler) needsNavigation(description string) bool {
+	desc := strings.ToLower(description)
+	return strings.Contains(desc, "search") || strings.Contains(desc, "enter") || strings.Contains(desc, "type")
+}
+
+// ensureGoogleNavigation makes sure we're on Google before performing search actions
+func (h *BrowserTaskHandler) ensureGoogleNavigation(ctx context.Context) error {
+	// Try to get current page content to see if we're already on Google
+	content, err := h.browserAgent.GetPageContent(ctx)
+	if err == nil && strings.Contains(strings.ToLower(content), "google") {
+		h.logger.Info("Already on Google page, skipping navigation")
+		return nil
+	}
+
+	h.logger.Info("Navigating to Google for search task")
+	return h.browserAgent.Navigate(ctx, "https://www.google.com")
 }

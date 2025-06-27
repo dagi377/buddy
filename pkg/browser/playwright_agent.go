@@ -4,15 +4,15 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/mxschmitt/playwright-go"
 	"github.com/ai-agent-framework/pkg/interfaces"
+	"github.com/mxschmitt/playwright-go"
 )
 
 // PlaywrightAgent implements the BrowserAgent interface using Playwright
 type PlaywrightAgent struct {
-	browser playwright.Browser
-	page    playwright.Page
-	logger  interfaces.Logger
+	browser  playwright.Browser
+	page     playwright.Page
+	logger   interfaces.Logger
 	headless bool
 }
 
@@ -72,10 +72,17 @@ func (p *PlaywrightAgent) Navigate(ctx context.Context, url string) error {
 
 	_, err := p.page.Goto(url, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateNetworkidle,
+		Timeout:   playwright.Float(30000), // 30 second timeout
 	})
 	if err != nil {
 		return fmt.Errorf("failed to navigate to %s: %w", url, err)
 	}
+
+	// Additional wait to ensure the page is fully interactive
+	p.page.WaitForLoadState("networkidle")
+
+	// Wait a bit more for JavaScript to initialize
+	p.page.WaitForTimeout(1000) // 1 second
 
 	p.logger.WithField("url", url).Info("Navigation completed")
 	return nil
@@ -166,7 +173,31 @@ func (p *PlaywrightAgent) Close(ctx context.Context) error {
 // Action handlers
 
 func (p *PlaywrightAgent) handleClick(action interfaces.BrowserAction) (interface{}, error) {
-	err := p.page.Click(action.Selector)
+	// Wait for the element to be available and visible first
+	_, err := p.page.WaitForSelector(action.Selector, playwright.PageWaitForSelectorOptions{
+		State:   playwright.WaitForSelectorStateVisible,
+		Timeout: playwright.Float(10000), // 10 second timeout
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to wait for element %s: %w", action.Selector, err)
+	}
+
+	// Wait for element to be actionable (not covered by other elements)
+	_, err = p.page.WaitForFunction(fmt.Sprintf(`
+		() => {
+			const element = document.querySelector('%s');
+			return element && !element.disabled && element.offsetWidth > 0 && element.offsetHeight > 0;
+		}
+	`, action.Selector), playwright.PageWaitForFunctionOptions{
+		Timeout: playwright.Float(5000),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("element %s is not clickable: %w", action.Selector, err)
+	}
+
+	err = p.page.Click(action.Selector, playwright.PageClickOptions{
+		Timeout: playwright.Float(5000),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to click element %s: %w", action.Selector, err)
 	}
@@ -174,10 +205,50 @@ func (p *PlaywrightAgent) handleClick(action interfaces.BrowserAction) (interfac
 }
 
 func (p *PlaywrightAgent) handleType(action interfaces.BrowserAction) (interface{}, error) {
-	err := p.page.Fill(action.Selector, action.Value)
+	// Wait for the element to be available and visible first
+	_, err := p.page.WaitForSelector(action.Selector, playwright.PageWaitForSelectorOptions{
+		State:   playwright.WaitForSelectorStateVisible,
+		Timeout: playwright.Float(10000), // 10 second timeout
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to wait for element %s: %w", action.Selector, err)
+	}
+
+	// Additional wait to ensure the element is fully interactive
+	_, err = p.page.WaitForFunction(fmt.Sprintf(`
+		() => {
+			const element = document.querySelector('%s');
+			return element && !element.disabled && element.offsetWidth > 0 && element.offsetHeight > 0;
+		}
+	`, action.Selector), playwright.PageWaitForFunctionOptions{
+		Timeout: playwright.Float(5000),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("element %s is not interactive: %w", action.Selector, err)
+	}
+
+	// Try clicking the element first to ensure it's focused
+	err = p.page.Click(action.Selector, playwright.PageClickOptions{
+		Timeout: playwright.Float(5000),
+	})
+	if err != nil {
+		p.logger.WithField("error", err).Warn("Failed to click element before typing, continuing anyway")
+	}
+
+	// Clear the field first, then type the new value
+	err = p.page.Fill(action.Selector, "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to clear element %s: %w", action.Selector, err)
+	}
+
+	// Type the value with a small delay between characters for better reliability
+	err = p.page.Type(action.Selector, action.Value, playwright.PageTypeOptions{
+		Delay: playwright.Float(50), // 50ms delay between keystrokes
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to type in element %s: %w", action.Selector, err)
 	}
+
 	return "typed", nil
 }
 
